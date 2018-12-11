@@ -3,15 +3,15 @@
 - name: Fail if not a supported release of Ubuntu
   fail:
     msg: "{{ ansible_distribution_version }} is not an acceptable version of Ubuntu for this role"
-  when: ansible_lsb.id|lower == "ubuntu" and ansible_distribution_version|version_compare('14.04', '<')
+  when: ansible_lsb.id|lower == "ubuntu" and ansible_distribution_version is version_compare('14.04', '<')
 
 - name: Fail if not a new release of Debian
   fail:
     msg: "{{ ansible_distribution_version }} is not an acceptable version of Debian for this role"
-  when: ansible_lsb.id|lower == "debian" and ansible_distribution_version|version_compare('8.5', '<')
+  when: ansible_lsb.id|lower == "debian" and ansible_distribution_version is version_compare('8.5', '<')
 
 - name: Update kernel, kernel extras, Xorg pkgs, and related tasks
-  include_tasks: kernel_check_and_update.yml
+  include: kernel_check_and_update.yml
   when: kernel_update_and_reboot_permitted or install_kernel_extras
 
 - name: Uninstall old versions of Docker
@@ -33,7 +33,8 @@
   with_items:
     - linux-image-extra-{{ ansible_kernel }}
     - linux-image-extra-virtual
-  when: docker_aufs_enabled and ansible_distribution_version|version_compare('14.04', '==')
+  when: docker_aufs_enabled and ansible_distribution_version is version_compare('14.04', '==') and ansible_kernel is version_compare('4.4', '<')
+
   register: linux_image_extra_install
   ignore_errors: yes
 
@@ -43,7 +44,7 @@
     state: present
     update_cache: yes
     cache_valid_time: "{{ docker_apt_cache_valid_time }}"
-  when: linux_image_extra_install|failed
+  when: linux_image_extra_install is failed
 
 - name: Ensure dirmngr is available
   apt:
@@ -62,7 +63,7 @@
 
 - name: Alternative | Add Docker repository key
   shell: "apt-key adv --fetch-keys {{ apt_key_url }}"
-  when: add_repository_key|failed
+  when: add_repository_key is failed
 
 - name: HTTPS APT transport for Docker repository
   apt:
@@ -92,7 +93,7 @@
 - name: Set systemd playbook var
   set_fact:
     is_systemd: true
-  when: ( ansible_distribution == "Ubuntu" and ansible_distribution_version|version_compare('15.04', '>=') or ansible_distribution == "Debian" )
+  when: ( ansible_distribution == "Ubuntu" and ansible_distribution_version is version_compare('15.04', '>=') or ansible_distribution == "Debian" )
   tags: always
 
 - name: Set docker_http_proxy_defined flag
@@ -105,11 +106,16 @@
     docker_https_proxy_defined: "{{ docker_https_proxy is defined and docker_https_proxy is not none and docker_https_proxy != '' }}"
   tags: proxy
 
+- name: Set docker_no_proxy_defined flag
+  set_fact:
+    docker_no_proxy_defined: "{{ docker_no_proxy is defined and docker_no_proxy is not none and docker_no_proxy != '' }}"
+  tags: proxy
+
 # https://github.com/moby/moby/issues/25471#issuecomment-263101090
 - name: Creates override directory (systemd)
   file:
     path: /etc/systemd/system/docker.service.d
-    state: "{{ (daemon_json is not none or docker_http_proxy_defined or docker_https_proxy_defined) | ternary('directory', 'absent') }}"
+    state: "{{ (daemon_json is not none or docker_http_proxy_defined or docker_https_proxy_defined or docker_no_proxy_defined) | ternary('directory', 'absent') }}"
     owner: root
     group: root
     mode: 0755
@@ -161,11 +167,11 @@
   when: docker_pkg_name == 'docker.io'
 
 - meta: flush_handlers
-  when: "dns_fix|changed"
+  when: "dns_fix is changed"
 
 - pause:
     seconds: 1
-  when: "dns_fix|changed"
+  when: "dns_fix is changed"
 
 - name: Check if /etc/updatedb.conf exists
   stat:
@@ -181,17 +187,19 @@
     line: 'PRUNEPATHS="/var/lib/docker \2"'
   when: updatedb_conf_exists.stat.exists
 
-- name: Check if /etc/default/ufw exists
-  stat:
-    path: /etc/default/ufw
-  register: ufw_default_exists
+- block:
+    - name: Check if /etc/default/ufw exists
+      stat:
+        path: /etc/default/ufw
+      register: ufw_default_exists
 
-- name: Change ufw default forward policy from drop to accept
-  lineinfile:
-    dest: /etc/default/ufw
-    regexp: "^DEFAULT_FORWARD_POLICY="
-    line: "DEFAULT_FORWARD_POLICY=\"ACCEPT\""
-  when: ufw_default_exists.stat.exists
+    - name: Change ufw default forward policy from drop to accept
+      lineinfile:
+        dest: /etc/default/ufw
+        regexp: "^DEFAULT_FORWARD_POLICY="
+        line: "DEFAULT_FORWARD_POLICY=\"ACCEPT\""
+      when: ufw_default_exists.stat.exists
+  when: ufw_set_forward_policy
 
 - name: Set docker HTTP_PROXY if docker_http_proxy defined
   lineinfile:
@@ -217,13 +225,25 @@
     - Restart docker
   tags: proxy
 
+- name: Set docker NO_PROXY if docker_no_proxy defined
+  lineinfile:
+    dest: /etc/default/docker
+    regexp: "^export no_proxy="
+    line: "export no_proxy=\"{{docker_no_proxy}}\""
+    state: "{{ docker_no_proxy_defined | ternary('present', 'absent') }}"
+  when:
+    - not is_systemd
+  notify:
+    - Restart docker
+  tags: proxy
+
 - name: Set docker HTTP(S)_PROXY if docker_http(s)_proxy defined (systemd)
   copy:
     content: |
       [Service]
       Environment="{% if docker_http_proxy_defined %}http_proxy={{ docker_http_proxy }}{% endif %}"
       Environment="{% if docker_https_proxy_defined %}https_proxy={{ docker_https_proxy }}{% endif %}"
-      Environment="no_proxy={{ docker_no_proxy | default('') }}"
+      Environment="{% if docker_no_proxy_defined %}no_proxy={{ docker_no_proxy }}{% endif %}"
     dest: /etc/systemd/system/docker.service.d/proxy.conf
     owner: root
     group: root
@@ -233,7 +253,7 @@
     - Restart docker
   when:
     - is_systemd
-    - docker_http_proxy_defined or docker_https_proxy_defined
+    - docker_http_proxy_defined or docker_https_proxy_defined or docker_no_proxy_defined
   tags: proxy
 
 - name: Remove docker HTTP(S)_PROXY if docker_http(s)_proxy undefined (systemd)
@@ -245,7 +265,7 @@
     - Restart docker
   when:
     - is_systemd
-    - not docker_http_proxy_defined and not docker_https_proxy_defined
+    - not docker_http_proxy_defined and not docker_https_proxy_defined and not docker_no_proxy_defined
   tags: proxy
 
 - name: Start docker
